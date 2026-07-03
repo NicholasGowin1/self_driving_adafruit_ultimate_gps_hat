@@ -5,7 +5,7 @@
 using namespace std;
 
 int main() {
-    std::ifstream file("coordinates.txt");   
+    std::ifstream file("coordinates_test.txt");   
     Path path;
 
     if (!file) {
