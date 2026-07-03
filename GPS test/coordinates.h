@@ -9,8 +9,8 @@ using namespace std;
  * @brief Structure to represent a 2D coordinate point.
  */
 struct Coordinates {
-    int x;
-    int y;
+    double x;
+    double y;
 };
 
 /**
@@ -27,7 +27,7 @@ struct Direction {
 class Path {
 public:
    
-    void add_point(int x, int y);
+    void add_point(double x, double y);
 
     
     void calculate_distances();
@@ -37,7 +37,7 @@ public:
    void print_path();
    int numPoints();
 
-   void setCurrentLocation(int x, int y);
+   void setCurrentLocation(double x, double y);
    
    Coordinates getCurrentLocation();
 
