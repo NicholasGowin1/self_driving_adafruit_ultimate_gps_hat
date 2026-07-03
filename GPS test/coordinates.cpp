@@ -4,7 +4,7 @@
 #include <cmath>
 using namespace std;
 
-void Path::add_point(int x, int y) {
+void Path::add_point(double x, double y) {
     points.push_back({x, y});
 }
 
@@ -29,9 +29,9 @@ string Path::steering_direction(int index, Coordinates currPosition) {
     }else{
         angle -= directions[index].angle;
     }
-    if(angle < 0){
+    if(angle < -2.5){
         return "right";
-    }else if(angle > 0){
+    }else if(angle > 2.5){
         return "left";
     }else{
         return "straight";
@@ -50,7 +50,7 @@ int Path::numPoints() {
     return points.size();
 }
 
-void Path::setCurrentLocation(int x, int y) {
+void Path::setCurrentLocation(double x, double y) {
     currLocation.x = x;
     currLocation.y = y;
 }
