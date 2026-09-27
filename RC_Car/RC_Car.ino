@@ -74,12 +74,23 @@ const double MAX_PLAUSIBLE_SPEED = 15.0; // Sanity ceiling - reject anything abo
 int driveValue = NEUTRAL_THROTTLE; 
 
 // Steering servo:
-// On THIS CAR, lower Servo.write() values turn RIGHT and higher values
-// turn LEFT. 95 is straight.
-// Keep these constants as physical directions, not mathematical signs.
-const int STR_RIGHT = 70;
+// Mechanical limits of the steering servo. 95 is straight.
+const int STR_MIN = 70;
 const int STR_CENTER = 95;
-const int STR_LEFT = 130;
+const int STR_MAX = 130;
+
+// MEASURED ON THIS CAR: higher Servo.write() values turn RIGHT, lower
+// values turn LEFT. Confirmed from a run where the navigation geometry
+// correctly called for a right turn (leg bearing ~200 deg vs heading
+// ~144 deg), commanded 70, and the car turned left.
+//
+// Keep these constants as physical directions, not mathematical signs:
+// everywhere below steers "towards STR_RIGHT" or "towards STR_LEFT"
+// rather than adding or subtracting raw servo numbers, so this is the
+// only place the polarity is encoded.
+const int STR_RIGHT = STR_MAX;
+const int STR_LEFT = STR_MIN;
+const int STR_RIGHT_SIGN = (STR_RIGHT > STR_CENTER) ? 1 : -1;
 int currentAngle = STR_CENTER;
 
 const int escPin = 6; 
@@ -633,9 +644,10 @@ void loop() {
 //   crossTrackErrorMeters > 0 = car is LEFT of the line  -> steer RIGHT
 //   headingErrorDeg       > 0 = leg runs LEFT of the car -> steer LEFT
 //
-// PHYSICAL SERVO MAPPING ON THIS CAR: lower value = RIGHT, higher = LEFT.
-// So the cross-track term subtracts from center and the heading term adds
-// to it.
+// Both are converted to a single signed "how many degrees of RIGHT do we
+// want" number, which STR_RIGHT_SIGN then turns into a servo value. A
+// left-of-line error wants right; a leg that runs left of the car's nose
+// wants left.
 int computeTargetSteeringAngle(double crossTrackErrorMeters, double headingErrorDeg) {
   double crossCorrection = 0.0;
   if (fabs(crossTrackErrorMeters) >= CROSS_TRACK_DEADBAND_METERS) {
@@ -651,8 +663,9 @@ int computeTargetSteeringAngle(double crossTrackErrorMeters, double headingError
     if (headingCorrection < -MAX_HEADING_CORRECTION_DEG) headingCorrection = -MAX_HEADING_CORRECTION_DEG;
   }
 
-  int target = STR_CENTER - (int)crossCorrection + (int)headingCorrection;
-  return constrain(target, STR_RIGHT, STR_LEFT);
+  double rightwardDeg = crossCorrection - headingCorrection;
+  int target = STR_CENTER + STR_RIGHT_SIGN * (int)rightwardDeg;
+  return constrain(target, STR_MIN, STR_MAX);
 }
 
 // Starts the next waypoint leg without using GPS heading. The car begins at
@@ -701,17 +714,14 @@ void performCornerTransition(int targetIndex) {
   }
 
   // turnAngleDeg > 0 means a LEFT corner; < 0 means a RIGHT corner.
-  // On this car lower servo = RIGHT and higher servo = LEFT.
-  int cornerSteer = (turnAngleDeg > 0.0)
-                  ? STR_CENTER + (int)correction   // LEFT
-                  : STR_CENTER - (int)correction; // RIGHT
+  double cornerRightwardDeg = (turnAngleDeg > 0.0) ? -correction : correction;
+  int cornerSteer = STR_CENTER + STR_RIGHT_SIGN * (int)cornerRightwardDeg;
 
-  // STR_RIGHT (70) is the low end and STR_LEFT (130) the high end, so
-  // they must be passed to constrain() in that order. Reversed, every
-  // value below 130 came back as 130 and the car took a full-lock LEFT
-  // turn out of every corner regardless of which way the path actually
-  // turned.
-  cornerSteer = constrain(cornerSteer, STR_RIGHT, STR_LEFT);
+  // constrain() needs its bounds numerically low-then-high. Reversed,
+  // every value below the high bound came back as the high bound and the
+  // car took a full-lock turn out of every corner regardless of which way
+  // the path actually turned.
+  cornerSteer = constrain(cornerSteer, STR_MIN, STR_MAX);
 
   Serial.print(F("--- Corner transition at WP "));
   Serial.print(targetIndex);
