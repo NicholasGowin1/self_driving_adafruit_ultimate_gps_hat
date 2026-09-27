@@ -92,6 +92,8 @@ const int STR_RIGHT = STR_MAX;
 const int STR_LEFT = STR_MIN;
 const int STR_RIGHT_SIGN = (STR_RIGHT > STR_CENTER) ? 1 : -1;
 int currentAngle = STR_CENTER;
+double commandedAngle = STR_CENTER; // sub-degree ramp state, see updateSteering()
+unsigned long lastSteeringUpdateMillis = 0;
 
 const int escPin = 6; 
 const int servoPin = 3;
@@ -211,20 +213,27 @@ const double STUCK_PROGRESS_THRESHOLD_METERS = 0.05;
 // Minimum improvement in distance-to-waypoint required to reset the stuck
 // counter. Smaller than this counts as "no real progress" for that update.
 
-const int MAX_TARGET_ANGLE_CHANGE_PER_UPDATE = 3;
-// PACING, applied to the TARGET angle itself -- separate from and in
-// addition to updateSteering()'s existing 1-degree-per-update ramp on
-// the PHYSICAL servo. That ramp smooths out how the servo chases
-// whatever the target currently is, but the target itself could still
-// jump straight to full lock in a single update if the raw heading error
-// called for it. This caps how much the target is allowed to move per
-// GPS fix, so a big correction unfolds gradually over several fixes
-// instead of being demanded all at once. "Steering to the waypoint is a
-// marathon, not a sprint": even a large heading error gets corrected a
-// few degrees at a time, trusting that there's time to get there rather
-// than needing to be right immediately. Raise this for a snappier (but
-// more aggressive) response; lower it for an even gentler one.
-int lastCommandedTarget = STR_CENTER;
+const double STEERING_SLEW_DEG_PER_SEC = 120.0;
+// How fast the servo is allowed to travel toward the commanded angle, in
+// degrees of servo travel per SECOND of wall time.
+//
+// This used to be one degree per call to updateSteering(), which was only
+// reached on a real GPS fix -- so the ramp rate was silently tied to the
+// fix rate. A 25-degree correction needed 25 fixes: 2.5 s at a perfect
+// 10 Hz and considerably worse whenever fixes were dropped, by which
+// point the car had driven metres past the point where the correction
+// was called for. At 120 deg/s the same 25-degree swing takes ~0.2 s and
+// takes exactly as long regardless of what GPS is doing.
+//
+// Raise for a snappier response; lower if the servo slams hard enough to
+// unsettle the car. The full 60-degree lock-to-lock sweep takes
+// 60 / this many seconds -- keep it within what the servo can physically
+// slew, or the commanded angle just runs ahead of the horn.
+
+const unsigned long MAX_STEERING_TICK_MS = 200;
+// Ceiling on the time delta a single slew step may integrate. Without it,
+// a long stall (GPS dropout, blocking setup call) would be followed by
+// one step large enough to snap the servo straight to the target.
 
 // --- DEAD RECKONING (fills the gap between real GPS fixes) ---
 const unsigned long DEAD_RECKON_INTERVAL_MS = 100;
@@ -523,6 +532,7 @@ void loop() {
   // not used by this controller.
   for (int i = 1; i < path.numPoints(); i++) {
     bool destinationReached = false;
+    int activeSteerTarget = STR_CENTER;
     double bestDistSeen = 1e9;
     int stuckCounter = 0;
     int recoveryAttempts = 0;
@@ -542,7 +552,13 @@ void loop() {
       if (!gotRealFix) {
         if (nowMillis - lastFixMillis > GPS_STALE_TIMEOUT_MS) {
           stopDrive();
+          continue;
         }
+        // Between fixes the last commanded angle is still the best
+        // available, and the servo may not have reached it yet -- keep
+        // ramping toward it instead of freezing mid-correction until the
+        // next fix lands.
+        updateSteering(activeSteerTarget);
         continue;
       }
 
@@ -625,6 +641,7 @@ void loop() {
       }
 
       int activeMaxThrottle = (i == 1) ? FIRST_GPS_WAYPOINT_MAX_THROTTLE : MAX_THROTTLE;
+      activeSteerTarget = targetSteerAngle;
       updateSteering(targetSteerAngle);
       updateCruiseControl(activeMaxThrottle);
     }
@@ -732,9 +749,7 @@ void performCornerTransition(int targetIndex) {
 
   unsigned long transitionStart = millis();
   lastFixMillis = transitionStart;
-  currentAngle = cornerSteer;
-  lastCommandedTarget = cornerSteer;
-  myservo.write(cornerSteer);
+  setSteeringImmediate(cornerSteer);
 
   while (millis() - transitionStart < CORNER_TRANSITION_TIMEOUT_MS) {
     bool gotRealFix = getCurrentGPS();
@@ -746,6 +761,7 @@ void performCornerTransition(int targetIndex) {
         Serial.println(F("*** GPS STALE DURING CORNER - STOPPED ***"));
         return;
       }
+      updateSteering(cornerSteer);
       continue;
     }
 
@@ -780,18 +796,41 @@ void performCornerTransition(int targetIndex) {
   Serial.println(F("*** CORNER TRANSITION TIMEOUT - STOPPED ***"));
 }
 
-// Moves the servo ONE degree per call toward targetAngle, rather than
-// looping to completion internally. The old version's inner for-loop +
-// delay(15) blocked for up to ~900ms per call despite being labeled
-// "non-blocking" -- this version returns immediately each call, so the
-// main loop stays responsive and steering updates track the target
-// smoothly rather than committing to a stale command for most of a second.
+// Moves the servo toward targetAngle at STEERING_SLEW_DEG_PER_SEC,
+// measured against millis() rather than against the number of calls, and
+// returns immediately. Call it as often as possible: extra calls make the
+// motion smoother but never faster, and the achieved rate no longer
+// depends on how often GPS happens to produce a fix.
+//
+// commandedAngle is kept as a double so that calls a few milliseconds
+// apart accumulate fractional degrees instead of being rounded away to no
+// movement at all.
 void updateSteering(int targetAngle) {
-  if (currentAngle < targetAngle) {
-    currentAngle++;
-  } else if (currentAngle > targetAngle) {
-    currentAngle--;
+  unsigned long now = millis();
+  unsigned long elapsedMs = now - lastSteeringUpdateMillis;
+  lastSteeringUpdateMillis = now;
+  if (elapsedMs > MAX_STEERING_TICK_MS) elapsedMs = MAX_STEERING_TICK_MS;
+
+  double maxStep = STEERING_SLEW_DEG_PER_SEC * (double)elapsedMs / 1000.0;
+  double delta = (double)targetAngle - commandedAngle;
+  if (delta > maxStep) delta = maxStep;
+  if (delta < -maxStep) delta = -maxStep;
+  commandedAngle += delta;
+
+  int rounded = constrain((int)(commandedAngle + 0.5), STR_MIN, STR_MAX);
+  if (rounded != currentAngle) {
+    currentAngle = rounded;
+    myservo.write(currentAngle);
   }
+}
+
+// Jumps the servo straight to an angle, bypassing the slew limit, and
+// resyncs the ramp state so the next updateSteering() continues from
+// where the servo physically is rather than from a stale angle.
+void setSteeringImmediate(int angle) {
+  currentAngle = constrain(angle, STR_MIN, STR_MAX);
+  commandedAngle = currentAngle;
+  lastSteeringUpdateMillis = millis();
   myservo.write(currentAngle);
 }
 
@@ -841,7 +880,7 @@ void updateCruiseControl(int activeMaxThrottle) {
 void stopDrive(){
   driveValue = NEUTRAL_THROTTLE;
   motorDriver.writeMicroseconds(driveValue);
-  myservo.write(STR_CENTER);
+  setSteeringImmediate(STR_CENTER);
 }
 
 void performRecoveryManeuver(double steerErrorAtStuck) {
@@ -852,8 +891,7 @@ void performRecoveryManeuver(double steerErrorAtStuck) {
   // is LEFT of the line and therefore needs a RIGHT recovery.
   bool wantLeft = (steerErrorAtStuck < 0.0);
   int recoverySteer = wantLeft ? STR_LEFT : STR_RIGHT;
-  myservo.write(recoverySteer);
-  currentAngle = recoverySteer;
+  setSteeringImmediate(recoverySteer);
 
   // DOUBLE-TAP: confirmed on the bench (not just assumed from the
   // datasheet) that this ESC reads a single reverse-range signal from a
@@ -868,15 +906,8 @@ void performRecoveryManeuver(double steerErrorAtStuck) {
   motorDriver.writeMicroseconds(REVERSE_THROTTLE);
   delay(RECOVERY_BACKUP_MS);
 
-  stopDrive();
+  stopDrive(); // also recentres the servo and resyncs the ramp state
   delay(RECOVERY_SETTLE_MS);
-
-  // stopDrive() just wrote the servo back to STR_CENTER physically -- sync
-  // both angle-tracking variables to match, so the pacing limiter and the
-  // servo ramp both start the next approach from where the car actually
-  // is, not from stale pre-recovery state.
-  currentAngle = STR_CENTER;
-  lastCommandedTarget = STR_CENTER;
 }
 
 // --- Raw I2C access to the u-blox module's DDC interface ---
