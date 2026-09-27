@@ -151,6 +151,38 @@ double Path::crossTrackErrorMeters(int index) {
     return cross / legLength;
 }
 
+// Signed angle from the car's heading to the direction of the active leg
+// (points[index-1] -> points[index]), in degrees, normalised to
+// (-180, 180]. Positive means the leg runs counter-clockwise of the
+// car's heading, i.e. the car needs to turn LEFT to line up with it.
+//
+// Cross-track error alone cannot start this turn: it is exactly zero at
+// the moment the car sits on the line, so a car sitting on the line but
+// pointed 50 degrees off it gets no correction at all and simply drives
+// out of the corridor.
+double Path::headingErrorToLegDegrees(int index) {
+    if (index <= 0 || index >= pointCount || !headingEstablished) {
+        return 0.0;
+    }
+
+    double startE, startN, endE, endN;
+    toLocalMeters(points[index - 1].x, points[index - 1].y, startE, startN);
+    toLocalMeters(points[index].x,     points[index].y,     endE,   endN);
+
+    double legE = endE - startE;
+    double legN = endN - startN;
+    if (sqrt(legE * legE + legN * legN) < 0.001) {
+        return 0.0;
+    }
+
+    const double PI_VAL = acos(-1.0);
+    double legBearing = atan2(legN, legE) * 180.0 / PI_VAL;
+    double error = legBearing - currentHeading;
+    while (error > 180.0) error -= 360.0;
+    while (error <= -180.0) error += 360.0;
+    return error;
+}
+
 double Path::alongTrackDistanceMeters(int index) {
     if (index <= 0 || index >= pointCount) {
         return 0.0;

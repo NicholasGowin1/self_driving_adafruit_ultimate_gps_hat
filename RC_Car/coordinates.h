@@ -50,6 +50,7 @@ public:
     double steering_error_predictive(int index, double lookaheadMeters);
     double crossTrackErrorMeters(int index);
     double alongTrackDistanceMeters(int index);
+    double headingErrorToLegDegrees(int index); // + = leg is left of the car's heading
     void print_path();
     int numPoints();
     void setCurrentLocation(int32_t lonE7, int32_t latE7);

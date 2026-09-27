@@ -95,6 +95,18 @@ double CROSS_TRACK_KP = 8.0; // servo degrees per meter of lateral error
 const double CROSS_TRACK_DEADBAND_METERS = 0.15;
 const double MAX_CROSS_TRACK_CORRECTION_DEG = 15.0;
 
+// Lateral error is only half the picture: it is exactly zero whenever the
+// car sits ON the line, no matter which way it is pointed. Starting a leg
+// at the waypoint with the car aimed 50 degrees off it therefore produced
+// no steering command at all -- the car drove straight out of the safety
+// corridor and stopped. This term steers on the angle between the car's
+// heading and the leg direction, so the two together behave like a
+// standard line follower: heading gets it pointed down the line,
+// cross-track keeps it on it.
+const double HEADING_KP = 0.5;              // servo degrees per degree of heading error
+const double HEADING_DEADBAND_DEG = 4.0;
+const double MAX_HEADING_CORRECTION_DEG = 25.0;
+
 // Cross-track alone cannot start a turn at a waypoint because the car is
 // exactly on the new line at the instant the waypoint is reached, making
 // cross-track error zero. These settings provide a short, position-only
@@ -109,8 +121,10 @@ const int CORNER_TRANSITION_MAX_THROTTLE = 1540;
 // Safety timeout: no fresh GPS fix -> neutral throttle.
 const unsigned long GPS_STALE_TIMEOUT_MS = 750;
 
-// Safety corridor around the active waypoint leg.
-const double MAX_ALLOWED_CROSS_TRACK_ERROR_METERS = 1.5;
+// Safety corridor around the active waypoint leg. Wide enough that a
+// normal correction arc plus a couple of meters of HDOP-1.7 GPS noise
+// doesn't trip it, but still well short of "driving at a wall".
+const double MAX_ALLOWED_CROSS_TRACK_ERROR_METERS = 3.0;
 
 // First GPS-controlled waypoint on concrete gets half of the original
 // available throttle range above neutral: 1500 + (1650-1500)/2 = 1575.
@@ -531,7 +545,8 @@ void loop() {
 
       double currentDistMeters = path.calculateCurrDistance(i);
       double crossTrackErrorMeters = path.crossTrackErrorMeters(i);
-      int targetSteerAngle = computeTargetSteeringAngleFromCrossTrackError(crossTrackErrorMeters);
+      double headingErrorDeg = path.headingErrorToLegDegrees(i);
+      int targetSteerAngle = computeTargetSteeringAngle(crossTrackErrorMeters, headingErrorDeg);
 
       Serial.print(F("WP ")); Serial.print(i + 1);
       Serial.print(F(" | Current: ")); printDegreesE7(liveLocation.x);
@@ -540,7 +555,8 @@ void loop() {
       Serial.print(F(", ")); printDegreesE7(targetLocation.y);
       Serial.print(F(" | Dist: ")); Serial.print(currentDistMeters, 2);
       Serial.print(F(" m | CrossTrack: ")); Serial.print(crossTrackErrorMeters, 3);
-      Serial.print(F(" m | Steer: ")); Serial.print(targetSteerAngle);
+      Serial.print(F(" m | HdgErr: ")); Serial.print(headingErrorDeg, 1);
+      Serial.print(F(" deg | Steer: ")); Serial.print(targetSteerAngle);
       Serial.print(F(" | Speed: ")); Serial.print(currentSpeedMs, 2);
       Serial.print(F(" m/s | Sats: ")); Serial.print(satellitesInUse);
       Serial.print(F(" | HDOP: ")); Serial.println(hdop, 1);
@@ -610,34 +626,32 @@ void loop() {
   }
 }
 
-// Converts signed GPS cross-track error (meters) into a SMALL steering command.
+// Combines the two GPS geometry errors for the active leg into one servo
+// command.
 //
-// Single actuator-facing convention:
-//   positive = car LEFT of line -> servo RIGHT (angle decreases)
-//   negative = car RIGHT of line -> servo LEFT (angle increases)
+// Geometry conventions (both produced by coordinates.cpp):
+//   crossTrackErrorMeters > 0 = car is LEFT of the line  -> steer RIGHT
+//   headingErrorDeg       > 0 = leg runs LEFT of the car -> steer LEFT
 //
-// The geometry function already returns that sign. There is no additional
-// inversion here.
-int computeTargetSteeringAngleFromCrossTrackError(double crossTrackErrorMeters) {
-  if (fabs(crossTrackErrorMeters) < CROSS_TRACK_DEADBAND_METERS) {
-    return STR_CENTER;
+// PHYSICAL SERVO MAPPING ON THIS CAR: lower value = RIGHT, higher = LEFT.
+// So the cross-track term subtracts from center and the heading term adds
+// to it.
+int computeTargetSteeringAngle(double crossTrackErrorMeters, double headingErrorDeg) {
+  double crossCorrection = 0.0;
+  if (fabs(crossTrackErrorMeters) >= CROSS_TRACK_DEADBAND_METERS) {
+    crossCorrection = crossTrackErrorMeters * CROSS_TRACK_KP;
+    if (crossCorrection > MAX_CROSS_TRACK_CORRECTION_DEG) crossCorrection = MAX_CROSS_TRACK_CORRECTION_DEG;
+    if (crossCorrection < -MAX_CROSS_TRACK_CORRECTION_DEG) crossCorrection = -MAX_CROSS_TRACK_CORRECTION_DEG;
   }
 
-  // Geometry convention:
-  //   positive = car LEFT of path  -> desired correction is RIGHT
-  //   negative = car RIGHT of path -> desired correction is LEFT
-  double correction = crossTrackErrorMeters * CROSS_TRACK_KP;
-  if (correction > MAX_CROSS_TRACK_CORRECTION_DEG) correction = MAX_CROSS_TRACK_CORRECTION_DEG;
-  if (correction < -MAX_CROSS_TRACK_CORRECTION_DEG) correction = -MAX_CROSS_TRACK_CORRECTION_DEG;
+  double headingCorrection = 0.0;
+  if (fabs(headingErrorDeg) >= HEADING_DEADBAND_DEG) {
+    headingCorrection = headingErrorDeg * HEADING_KP;
+    if (headingCorrection > MAX_HEADING_CORRECTION_DEG) headingCorrection = MAX_HEADING_CORRECTION_DEG;
+    if (headingCorrection < -MAX_HEADING_CORRECTION_DEG) headingCorrection = -MAX_HEADING_CORRECTION_DEG;
+  }
 
-  // PHYSICAL SERVO MAPPING ON THIS CAR:
-  //   lower value = RIGHT
-  //   higher value = LEFT
-  //
-  // Therefore POSITIVE geometry error (needs RIGHT) must DECREASE
-  // the servo value, while NEGATIVE geometry error (needs LEFT)
-  // must INCREASE it.
-  int target = STR_CENTER - (int)correction;
+  int target = STR_CENTER - (int)crossCorrection + (int)headingCorrection;
   return constrain(target, STR_RIGHT, STR_LEFT);
 }
 
