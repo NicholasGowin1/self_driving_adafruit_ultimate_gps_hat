@@ -5,60 +5,80 @@
 // Meters per degree of LATITUDE is very close to constant everywhere on
 // Earth (~111,320 m). Meters per degree of LONGITUDE shrinks toward the
 // poles by a factor of cos(latitude) -- toLocalMeters() applies that
-// correction using the origin's latitude. This is the same "~1 meter per
-// 0.000009 degrees" scale the .ino's DEG_PER_METER constant approximates
-// (1 / 0.000009 = 111,111, matching within ~0.2%) -- kept consistent here
-// so calculateCurrDistance() below can keep returning values in the same
-// units the .ino already expects and divides by DEG_PER_METER.
+// correction using the origin's latitude.
 const double METERS_PER_DEG_LAT = 111320.0;
-const double DEG_PER_METER_APPROX = 0.000009; // must match the .ino's DEG_PER_METER
+// Meters per 1e-7 degree of latitude -- the scale factor that turns an
+// exact int32 E7 difference into local meters.
+const double METERS_PER_E7_LAT = METERS_PER_DEG_LAT * 1.0e-7;
+
+void printDegreesE7(int32_t valueE7) {
+    if (valueE7 < 0) {
+        Serial.print('-');
+    }
+    uint32_t magnitude = (valueE7 < 0) ? (~(uint32_t)valueE7 + 1UL) : (uint32_t)valueE7;
+    uint32_t whole = magnitude / 10000000UL;
+    uint32_t frac = magnitude % 10000000UL;
+    Serial.print(whole);
+    Serial.print('.');
+    for (uint32_t divisor = 1000000UL; divisor >= 10UL; divisor /= 10UL) {
+        Serial.print((frac / divisor) % 10UL);
+    }
+    Serial.print(frac % 10UL);
+}
 
 Path::Path() {
     pointCount = 0;
-    currLocation.x = 0.0;
-    currLocation.y = 0.0;
+    currLocation.x = 0;
+    currLocation.y = 0;
     currentHeading = 0.0;
     headingEstablished = false;
     originSet = false;
-    originX = 0.0;
-    originY = 0.0;
+    originX = 0;
+    originY = 0;
     cosOriginLat = 1.0;
 }
 
 // Locks in the local tangent-plane origin the first time this class sees
 // any real coordinate (whichever comes first: add_point, setCurrentLocation,
 // or updateFromGPS). A no-op every call after that.
-void Path::ensureOrigin(double x, double y) {
+void Path::ensureOrigin(int32_t lonE7, int32_t latE7) {
     if (!originSet) {
-        originX = x;
-        originY = y;
+        originX = lonE7;
+        originY = latE7;
         const double PI_VAL = acos(-1.0);
-        cosOriginLat = cos(y * PI_VAL / 180.0);
+        cosOriginLat = cos((latE7 * 1.0e-7) * PI_VAL / 180.0);
         originSet = true;
     }
 }
 
-// Converts an absolute decimal-degree lon/lat into local east/north
-// meters relative to the origin. Subtracting two nearby doubles like
-// -105.0167711 and -105.0167541 is numerically clean (no cancellation
-// error) -- what it buys us is that everything downstream (atan2, sqrt)
-// now operates on small numbers where a float's full precision is
-// actually useful, instead of on a large absolute value where most of
-// that precision is wasted on digits shared by every point on the path.
-void Path::toLocalMeters(double x, double y, double &outEastMeters, double &outNorthMeters) {
-    ensureOrigin(x, y);
-    double dLon = x - originX;
-    double dLat = y - originY;
-    outEastMeters = dLon * METERS_PER_DEG_LAT * cosOriginLat;
-    outNorthMeters = dLat * METERS_PER_DEG_LAT;
+// Converts an absolute E7 lon/lat into local east/north meters relative
+// to the origin. The subtraction happens in exact int32 arithmetic and
+// only the small result is ever converted to floating point, so the
+// full 1.1 cm resolution of the fix survives into the geometry below.
+void Path::toLocalMeters(int32_t lonE7, int32_t latE7, double &outEastMeters, double &outNorthMeters) {
+    ensureOrigin(lonE7, latE7);
+    int32_t dLonE7 = lonE7 - originX;
+    int32_t dLatE7 = latE7 - originY;
+    outEastMeters = dLonE7 * METERS_PER_E7_LAT * cosOriginLat;
+    outNorthMeters = dLatE7 * METERS_PER_E7_LAT;
 }
 
-void Path::add_point(double x, double y) {
+int32_t Path::lonE7FromEastMeters(double eastMeters) {
+    double e7 = eastMeters / (METERS_PER_E7_LAT * cosOriginLat);
+    return originX + (int32_t)(e7 + (e7 < 0.0 ? -0.5 : 0.5));
+}
+
+int32_t Path::latE7FromNorthMeters(double northMeters) {
+    double e7 = northMeters / METERS_PER_E7_LAT;
+    return originY + (int32_t)(e7 + (e7 < 0.0 ? -0.5 : 0.5));
+}
+
+void Path::add_point(int32_t lonE7, int32_t latE7) {
     // Only add a point if we haven't hit the memory limit
     if (pointCount < MAX_POINTS) {
-        ensureOrigin(x, y);
-        points[pointCount].x = x;
-        points[pointCount].y = y;
+        ensureOrigin(lonE7, latE7);
+        points[pointCount].x = lonE7;
+        points[pointCount].y = latE7;
         pointCount++;
     }
 }
@@ -202,11 +222,8 @@ double Path::steering_error_predictive(int index, double lookaheadMeters) {
     toLocalMeters(points[index].x, points[index].y, tgtE, tgtN);
 
     double headingRad = currentHeading * PI_VAL / 180.0;
-    // Project forward directly in local meters. Previously this had to
-    // approximate lookaheadMeters as a degree offset (DEG_PER_METER) and
-    // add it onto raw lon/lat before converting back -- now that we're
-    // already working in a meters-based local frame, the projection is
-    // just a straight meters offset, with no approximation step at all.
+    // Project forward directly in local meters -- no degree/meter
+    // approximation is involved.
     double predictedE = curE + cos(headingRad) * lookaheadMeters;
     double predictedN = curN + sin(headingRad) * lookaheadMeters;
 
@@ -224,9 +241,9 @@ void Path::print_path() {
         Serial.print("Point ");
         Serial.print(i);
         Serial.print(": (");
-        Serial.print(points[i].x, 8); // Print to 8 decimal places for GPS accuracy
+        printDegreesE7(points[i].x);
         Serial.print(", ");
-        Serial.print(points[i].y, 8);
+        printDegreesE7(points[i].y);
         Serial.print(") -> Dist(m): ");
         Serial.print(directions[i].distance, 6);
         Serial.print(", Angle: ");
@@ -254,14 +271,14 @@ void Path::setInitialHeading(double compassBearingDegrees) {
     headingEstablished = true;
 }
 
-void Path::setCurrentLocation(double x, double y) {
+void Path::setCurrentLocation(int32_t lonE7, int32_t latE7) {
     // Position-only update, no heading logic. Used during startup
     // calibration, before the car is actually navigating and before
     // setInitialHeading() seeds a real heading -- heading tracking for
     // the actual drive happens in updateFromGPS() below.
-    ensureOrigin(x, y);
-    currLocation.x = x;
-    currLocation.y = y;
+    ensureOrigin(lonE7, latE7);
+    currLocation.x = lonE7;
+    currLocation.y = latE7;
 }
 
 // Blends two headings (degrees) on the unit circle rather than averaging
@@ -299,7 +316,7 @@ double Path::blendHeadings(double oldHeadingDeg, double newHeadingDeg, double al
 // Whatever new measurement is taken gets passed through a low-pass
 // filter (blendHeadings) rather than applied directly, so a single bad
 // fix can only nudge the heading a little instead of snapping to it.
-void Path::updateFromGPS(double x, double y, double speedMs, double gpsCourseDeg, bool courseValid) {
+void Path::updateFromGPS(int32_t lonE7, int32_t latE7, double speedMs, double gpsCourseDeg, bool courseValid) {
     const double MIN_SPEED_FOR_HEADING = 0.3;       // m/s -- below this, both GPS
                                                       // course and position-differencing
                                                       // are too noisy relative to actual
@@ -325,10 +342,10 @@ void Path::updateFromGPS(double x, double y, double speedMs, double gpsCourseDeg
                                                       // higher (e.g. 0.5) = reacts faster
                                                       // but lets more noise through.
 
-    ensureOrigin(x, y);
+    ensureOrigin(lonE7, latE7);
     double prevE, prevN, newE, newN;
     toLocalMeters(currLocation.x, currLocation.y, prevE, prevN);
-    toLocalMeters(x, y, newE, newN);
+    toLocalMeters(lonE7, latE7, newE, newN);
     double dE = newE - prevE;
     double dN = newN - prevN;
     double movedDist = sqrt(dE * dE + dN * dN); // real meters
@@ -362,8 +379,8 @@ void Path::updateFromGPS(double x, double y, double speedMs, double gpsCourseDeg
         }
     }
 
-    currLocation.x = x;
-    currLocation.y = y;
+    currLocation.x = lonE7;
+    currLocation.y = latE7;
 }
 
 double Path::getCurrentHeading() {
@@ -399,16 +416,17 @@ void Path::predictAhead(double elapsedSeconds, double speedMs) {
     double newE = curE + cos(headingRad) * distMeters;
     double newN = curN + sin(headingRad) * distMeters;
 
-    // Back to absolute lon/lat, inverting the same toLocalMeters() scaling.
-    currLocation.x = originX + (newE / (METERS_PER_DEG_LAT * cosOriginLat));
-    currLocation.y = originY + (newN / METERS_PER_DEG_LAT);
+    // Back to absolute E7 lon/lat, inverting the same toLocalMeters() scaling.
+    currLocation.x = lonE7FromEastMeters(newE);
+    currLocation.y = latE7FromNorthMeters(newN);
 }
 
 Coordinates Path::getCurrentLocation(){
     Serial.print("Current Location - X: ");
-    Serial.print(currLocation.x, 8);
+    printDegreesE7(currLocation.x);
     Serial.print(" Y: ");
-    Serial.println(currLocation.y, 8);
+    printDegreesE7(currLocation.y);
+    Serial.println();
     return currLocation;
 }
 
@@ -421,14 +439,7 @@ double Path::calculateCurrDistance(int index) {
     toLocalMeters(points[index].x, points[index].y, tgtE, tgtN);
     double dE = tgtE - curE;
     double dN = tgtN - curN;
-    double realMeters = sqrt(dE * dE + dN * dN);
-    // Converted back into the same "pseudo-degree" units the .ino has
-    // always expected from this function (it recovers real meters via
-    // `/ DEG_PER_METER`) so no caller needs to change. The distance
-    // itself is now computed correctly from real local meters instead
-    // of a raw degree-space Euclidean distance that silently mixed two
-    // axes with different real-world scale.
-    return realMeters * DEG_PER_METER_APPROX;
+    return sqrt(dE * dE + dN * dN);
 }
 
 double Path::calculateCurrAngle(int index){

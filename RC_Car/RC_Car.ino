@@ -22,8 +22,11 @@ uint8_t nmeaIndex = 0;
 bool birdDetected = false;
 
 // Navigation Data
-double xVal = 0.0; 
-double yVal = 0.0; 
+// Position is carried as int32 in units of 1e-7 degrees ("E7") -- see the
+// Coordinates comment in coordinates.h for why a double/float can't hold a
+// usable fix on this board.
+int32_t xValE7 = 0;
+int32_t yValE7 = 0;
 double currentSpeedMs = 0.0; // Updated by GPS 
 
 // GPS Fix Quality Data
@@ -51,13 +54,12 @@ const double MAX_HDOP_FOR_LOCK = 2.0;
 // bias that varies from power-cycle to power-cycle (the cause of whole
 // sessions coming out shifted relative to each other) rather than just
 // hoping the receiver "settles" to the right answer on its own.
-const double KNOWN_START_LON = -105.0167541;
-const double KNOWN_START_LAT = 39.9708443;
-double calibOffsetLon = 0.0;
-double calibOffsetLat = 0.0;
+const int32_t KNOWN_START_LON_E7 = -1050167541L;
+const int32_t KNOWN_START_LAT_E7 = 399708443L;
+int32_t calibOffsetLonE7 = 0;
+int32_t calibOffsetLatE7 = 0;
 
 Path path;
-Coordinates currentLocation;
 
 Servo motorDriver;  
 Servo myservo;  
@@ -82,8 +84,8 @@ int currentAngle = STR_CENTER;
 
 const int escPin = 6; 
 const int servoPin = 3;
-double startX = 0;
-double startY = 0;
+int32_t startXE7 = 0;
+int32_t startYE7 = 0;
 
 // --- GPS LINE-FOLLOWING STEERING ---
 // Positive cross-track error means the car is LEFT of the directed waypoint
@@ -164,13 +166,6 @@ double LOOKAHEAD_METERS = 2.5;
 // NOTE: this is a CEILING, not a fixed value -- see ADAPTIVE LOOKAHEAD
 // below, which shrinks it automatically as the car nears a waypoint.
 
-const double DEG_PER_METER = 0.000009;
-// Same "~1 meter per 0.000009 degrees" approximation used inside
-// coordinates.cpp's steering_error_predictive(). Used here to convert
-// currentDist (in lat/lon-degree units) into real meters for the
-// adaptive lookahead calculation below. If you ever change one, change
-// the other to match.
-
 const double MIN_LOOKAHEAD_METERS = 0.3;
 // Floor for the adaptive lookahead so it never collapses to exactly
 // zero right as the car reaches a waypoint.
@@ -187,10 +182,9 @@ const int STUCK_UPDATE_LIMIT = 30;
 // slow progress (e.g. a wide, deliberate turn) is being mistaken for
 // being stuck.
 
-const double STUCK_PROGRESS_THRESHOLD = 0.0000005; // ~0.05m
-// Minimum improvement in distance-to-waypoint (in the same lat/lon-degree
-// units as currentDist) required to reset the stuck counter. Smaller
-// than this counts as "no real progress" for that update.
+const double STUCK_PROGRESS_THRESHOLD_METERS = 0.05;
+// Minimum improvement in distance-to-waypoint required to reset the stuck
+// counter. Smaller than this counts as "no real progress" for that update.
 
 const int MAX_TARGET_ANGLE_CHANGE_PER_UPDATE = 3;
 // PACING, applied to the TARGET angle itself -- separate from and in
@@ -276,10 +270,10 @@ const double INITIAL_MANEUVER_MAX_METERS = 8.0;
 // make the progress this maneuver assumed it would.
 
 const double INITIAL_MANEUVER_ARRIVAL_METERS = 1.6;
-// Matches the main loop's own arrival radius (currentDist > 0.000015, ~1.6m
-// at this latitude). Used only during the open-loop startup maneuver below,
-// to let GPS confirm early arrival at waypoint 1 and cut the blind drive
-// short instead of always running the full time-based duration.
+// Matches the main loop's own arrival radius. Used only during the
+// open-loop startup maneuver below, to let GPS confirm early arrival at
+// waypoint 1 and cut the blind drive short instead of always running the
+// full time-based duration.
 
 const int INITIAL_MANEUVER_THROTTLE = MIN_THROTTLE + 20;
 // Deliberately modest and FIXED (not driven by updateCruiseControl's
@@ -424,31 +418,31 @@ void setup() {
 
   Serial.println(F("Calibrating against known starting location..."));
 
-  double sumLon = 0.0, sumLat = 0.0;
+  // Averaged as offsets FROM the known start rather than as absolute
+  // coordinates: the deltas are a few hundred E7 units, so the sum can't
+  // overflow an int32 the way ten absolute longitudes would.
+  int32_t sumDLonE7 = 0, sumDLatE7 = 0;
   int collected = 0;
 
   while (collected < CALIBRATION_FIX_COUNT) {
     if (getCurrentGPS()) {
-      sumLon += xVal;
-      sumLat += yVal;
+      sumDLonE7 += (xValE7 - KNOWN_START_LON_E7);
+      sumDLatE7 += (yValE7 - KNOWN_START_LAT_E7);
       collected++;
     }
   }
 
-  double avgLon = sumLon / CALIBRATION_FIX_COUNT;
-  double avgLat = sumLat / CALIBRATION_FIX_COUNT;
+  calibOffsetLonE7 = -(sumDLonE7 / CALIBRATION_FIX_COUNT);
+  calibOffsetLatE7 = -(sumDLatE7 / CALIBRATION_FIX_COUNT);
 
-  calibOffsetLon = KNOWN_START_LON - avgLon;
-  calibOffsetLat = KNOWN_START_LAT - avgLat;
-
-  Serial.print(F("Calibration offset - Lon: ")); Serial.print(calibOffsetLon, 8);
-  Serial.print(F(" Lat: ")); Serial.println(calibOffsetLat, 8);
+  Serial.print(F("Calibration offset - Lon: ")); printDegreesE7(calibOffsetLonE7);
+  Serial.print(F(" Lat: ")); printDegreesE7(calibOffsetLatE7); Serial.println();
 
   // Apply the offset retroactively to the averaged reading so the very
   // first stored location is already corrected.
-  xVal += calibOffsetLon;
-  yVal += calibOffsetLat;
-  path.setCurrentLocation(xVal, yVal);
+  xValE7 += calibOffsetLonE7;
+  yValE7 += calibOffsetLatE7;
+  path.setCurrentLocation(xValE7, yValE7);
 
   // This car always starts facing roughly the same direction (~144 deg
   // from north, SE). Seeding the heading here means steering has a real
@@ -459,27 +453,27 @@ void setup() {
 
   // inserting all the coordinates
 
-  startX = path.getCurrentLocation().x;
+  startXE7 = path.getCurrentLocation().x;
 
-  startY = path.getCurrentLocation().y;
+  startYE7 = path.getCurrentLocation().y;
 
-  path.add_point(startX, startY);
+  path.add_point(startXE7, startYE7);
 
-  path.add_point(-105.0167711, 39.9708088);
+  path.add_point(-1050167711L, 399708088L);
 
-  path.add_point(-105.0167990, 39.9707661);
+  path.add_point(-1050167990L, 399707661L);
 
-  path.add_point(-105.0168352, 39.9707112);
+  path.add_point(-1050168352L, 399707112L);
 
-  path.add_point(-105.0167993, 39.9706823);
+  path.add_point(-1050167993L, 399706823L);
 
-  path.add_point(-105.0167172, 39.9706728);
+  path.add_point(-1050167172L, 399706728L);
 
-  path.add_point(-105.0166487, 39.9706992);
+  path.add_point(-1050166487L, 399706992L);
 
-  path.add_point(-105.0166014, 39.9707620);
+  path.add_point(-1050166014L, 399707620L);
 
-  path.add_point(-105.0166020, 39.9708347);
+  path.add_point(-1050166020L, 399708347L);
 
   path.calculate_distances(); // must run after all points are added
 
@@ -535,16 +529,16 @@ void loop() {
       Coordinates liveLocation = path.getCurrentLocation();
       Coordinates targetLocation = path.getCurrentPath(i);
 
-      double currentDist = path.calculateCurrDistance(i);
+      double currentDistMeters = path.calculateCurrDistance(i);
       double crossTrackErrorMeters = path.crossTrackErrorMeters(i);
       int targetSteerAngle = computeTargetSteeringAngleFromCrossTrackError(crossTrackErrorMeters);
 
       Serial.print(F("WP ")); Serial.print(i + 1);
-      Serial.print(F(" | Current: ")); Serial.print(liveLocation.x, 8);
-      Serial.print(F(", ")); Serial.print(liveLocation.y, 8);
-      Serial.print(F(" | Target: ")); Serial.print(targetLocation.x, 8);
-      Serial.print(F(", ")); Serial.print(targetLocation.y, 8);
-      Serial.print(F(" | Dist: ")); Serial.print(currentDist / DEG_PER_METER, 2);
+      Serial.print(F(" | Current: ")); printDegreesE7(liveLocation.x);
+      Serial.print(F(", ")); printDegreesE7(liveLocation.y);
+      Serial.print(F(" | Target: ")); printDegreesE7(targetLocation.x);
+      Serial.print(F(", ")); printDegreesE7(targetLocation.y);
+      Serial.print(F(" | Dist: ")); Serial.print(currentDistMeters, 2);
       Serial.print(F(" m | CrossTrack: ")); Serial.print(crossTrackErrorMeters, 3);
       Serial.print(F(" m | Steer: ")); Serial.print(targetSteerAngle);
       Serial.print(F(" | Speed: ")); Serial.print(currentSpeedMs, 2);
@@ -552,7 +546,7 @@ void loop() {
       Serial.print(F(" | HDOP: ")); Serial.println(hdop, 1);
 
       // Waypoint arrival radius: ~1.6 m, matching the existing project.
-      if (currentDist <= 0.000015) {
+      if (currentDistMeters <= 1.6) {
         Serial.print(F("--- Reached Waypoint "));
         Serial.println(i + 1);
         stopDrive();
@@ -573,8 +567,8 @@ void loop() {
       }
 
       // Existing stuck detector, retained as a secondary failsafe.
-      if (currentDist < bestDistSeen - STUCK_PROGRESS_THRESHOLD) {
-        bestDistSeen = currentDist;
+      if (currentDistMeters < bestDistSeen - STUCK_PROGRESS_THRESHOLD_METERS) {
+        bestDistSeen = currentDistMeters;
         stuckCounter = 0;
       } else {
         stuckCounter++;
@@ -663,14 +657,14 @@ void performCornerTransition(int targetIndex) {
   Coordinates p1 = path.getCurrentPath(targetIndex - 1);
   Coordinates p2 = path.getCurrentPath(targetIndex);
 
-  const double METERS_PER_DEG = 111320.0;
-  double meanLat = (p0.y + p1.y + p2.y) / 3.0;
-  double lonScale = METERS_PER_DEG * cos(meanLat * acos(-1.0) / 180.0);
+  const double METERS_PER_E7_DEG = 111320.0e-7;
+  double meanLat = ((double)p0.y + (double)p1.y + (double)p2.y) / 3.0 * 1.0e-7;
+  double lonScale = METERS_PER_E7_DEG * cos(meanLat * acos(-1.0) / 180.0);
 
-  double inE = (p1.x - p0.x) * lonScale;
-  double inN = (p1.y - p0.y) * METERS_PER_DEG;
-  double outE = (p2.x - p1.x) * lonScale;
-  double outN = (p2.y - p1.y) * METERS_PER_DEG;
+  double inE = (double)(p1.x - p0.x) * lonScale;
+  double inN = (double)(p1.y - p0.y) * METERS_PER_E7_DEG;
+  double outE = (double)(p2.x - p1.x) * lonScale;
+  double outN = (double)(p2.y - p1.y) * METERS_PER_E7_DEG;
 
   double inLen = sqrt(inE * inE + inN * inN);
   double outLen = sqrt(outE * outE + outN * outN);
@@ -698,7 +692,12 @@ void performCornerTransition(int targetIndex) {
                   ? STR_CENTER + (int)correction   // LEFT
                   : STR_CENTER - (int)correction; // RIGHT
 
-  cornerSteer = constrain(cornerSteer, STR_LEFT, STR_RIGHT);
+  // STR_RIGHT (70) is the low end and STR_LEFT (130) the high end, so
+  // they must be passed to constrain() in that order. Reversed, every
+  // value below 130 came back as 130 and the car took a full-lock LEFT
+  // turn out of every corner regardless of which way the path actually
+  // turned.
+  cornerSteer = constrain(cornerSteer, STR_RIGHT, STR_LEFT);
 
   Serial.print(F("--- Corner transition at WP "));
   Serial.print(targetIndex);
@@ -1021,12 +1020,40 @@ void checkGGA(char *sentence) {
   if (strlen(fields[8]) > 0) hdop = atof(fields[8]);
 }
 
-// Converts raw NMEA DDMM.MMMM (degrees + decimal minutes) into plain
-// decimal degrees.
-double convertToDecimalDegrees(double raw) {
-  int degrees = (int)(raw / 100);
-  double minutes = raw - (degrees * 100);
-  return degrees + (minutes / 60.0);
+// Converts a raw NMEA DDDMM.MMMMM field (degrees + decimal minutes) into
+// 1e-7 degrees, entirely in integer arithmetic. Going through atof()/a
+// float here was the original precision loss: the parsed value had
+// already been rounded onto a ~0.65 m grid before any navigation math ran.
+int32_t nmeaFieldToE7(const char *field) {
+  uint32_t wholeMinutes = 0;   // DDDMM as an integer
+  uint32_t fracMinutesE5 = 0;  // digits after the decimal point, scaled to 1e-5 minutes
+  uint32_t fracScale = 10000UL;
+  bool seenDot = false;
+
+  for (const char *p = field; *p != '\0'; p++) {
+    if (*p == '.') {
+      seenDot = true;
+      continue;
+    }
+    if (*p < '0' || *p > '9') {
+      return 0;
+    }
+    uint8_t digit = (uint8_t)(*p - '0');
+    if (!seenDot) {
+      wholeMinutes = wholeMinutes * 10UL + digit;
+    } else if (fracScale > 0UL) {
+      fracMinutesE5 += digit * fracScale;
+      fracScale /= 10UL;
+    }
+  }
+
+  uint32_t degrees = wholeMinutes / 100UL;
+  uint32_t minutesE5 = (wholeMinutes % 100UL) * 100000UL + fracMinutesE5;
+
+  // minutes -> degrees is a divide by 60; in E7 units that is
+  // minutesE5 * 1e7 / (1e5 * 60) = minutesE5 * 10 / 6. minutesE5 stays
+  // below 1e7, so the intermediate fits a uint32.
+  return (int32_t)(degrees * 10000000UL + (minutesE5 * 10UL) / 6UL);
 }
 
 // Parses $GNRMC/$GPRMC sentences for position, speed, and course-over-ground.
@@ -1047,11 +1074,11 @@ bool parseRMC(char *sentence) {
 
   if (strlen(latStr) == 0 || strlen(lonStr) == 0) return false;
 
-  double parsedY = convertToDecimalDegrees(atof(latStr));
-  double parsedX = convertToDecimalDegrees(atof(lonStr));
+  int32_t parsedYE7 = nmeaFieldToE7(latStr);
+  int32_t parsedXE7 = nmeaFieldToE7(lonStr);
 
-  if (nsStr[0] == 'S') parsedY *= -1.0;
-  if (ewStr[0] == 'W') parsedX *= -1.0;
+  if (nsStr[0] == 'S') parsedYE7 = -parsedYE7;
+  if (ewStr[0] == 'W') parsedXE7 = -parsedXE7;
 
   double parsedSpeed = (strlen(speedStr) > 0) ? atof(speedStr) * 0.514444 : 0.0;
 
@@ -1067,11 +1094,11 @@ bool parseRMC(char *sentence) {
     courseValid = true;
   }
 
-  xVal = parsedX + calibOffsetLon;
-  yVal = parsedY + calibOffsetLat;
+  xValE7 = parsedXE7 + calibOffsetLonE7;
+  yValE7 = parsedYE7 + calibOffsetLatE7;
   currentSpeedMs = parsedSpeed;
 
-  path.updateFromGPS(xVal, yVal, currentSpeedMs, gpsCourseDeg, courseValid);
+  path.updateFromGPS(xValE7, yValE7, currentSpeedMs, gpsCourseDeg, courseValid);
 
   return true;
 }

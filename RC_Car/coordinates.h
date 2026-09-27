@@ -2,6 +2,7 @@
 #define PATH_H
 
 #include <Arduino.h> // Required for standard Arduino String
+#include <stdint.h>
 
 #define MAX_POINTS 16 // Sized for realistic path lengths (currently 9 points
                        // used) with headroom, not the full 50 the original
@@ -15,10 +16,25 @@
                        // that). Raise this only as far as your actual
                        // longest planned path needs.
 
+// Positions are held as signed integers in units of 1e-7 degrees
+// ("E7"), never as double/float degrees. On AVR, double IS float: a
+// 24-bit mantissa can only resolve about 7.6e-6 degrees near longitude
+// -105, i.e. a 0.65 m east / 0.43 m north grid. Every fix therefore
+// snapped to that grid before any geometry ran, which quantised
+// cross-track error into ~0.6 m steps and inverted its sign for true
+// offsets under ~0.3 m -- the car steering away from the line instead of
+// back onto it. int32 E7 covers the full +-180 degrees with 1.1 cm
+// resolution and is exact under subtraction, so the local-meters
+// conversion below is the first place a float is used at all.
 struct Coordinates {
-    double x; // longitude, decimal degrees
-    double y; // latitude, decimal degrees
+    int32_t x; // longitude, 1e-7 degrees
+    int32_t y; // latitude, 1e-7 degrees
 };
+
+// Prints an E7 value as plain decimal degrees (7 decimal places) using
+// integer math, so the serial log shows the real resolution of the fix
+// instead of float noise padded out to 8 digits.
+void printDegreesE7(int32_t valueE7);
 
 struct Direction {
     double distance; // meters -- see calculate_distances()
@@ -28,7 +44,7 @@ struct Direction {
 class Path {
 public:
     Path(); // Constructor to set up the arrays
-    void add_point(double x, double y);
+    void add_point(int32_t lonE7, int32_t latE7);
     void calculate_distances();
     double steering_error(int index);
     double steering_error_predictive(int index, double lookaheadMeters);
@@ -36,16 +52,12 @@ public:
     double alongTrackDistanceMeters(int index);
     void print_path();
     int numPoints();
-    void setCurrentLocation(double x, double y);
-    void updateFromGPS(double x, double y, double speedMs, double gpsCourseDeg, bool courseValid);
+    void setCurrentLocation(int32_t lonE7, int32_t latE7);
+    void updateFromGPS(int32_t lonE7, int32_t latE7, double speedMs, double gpsCourseDeg, bool courseValid);
     void setInitialHeading(double compassBearingDegrees);
     Coordinates getCurrentLocation();
     double getCurrentHeading();
-    double calculateCurrDistance(int index); // returns the same "pseudo-degree"
-                                              // units as before (caller recovers
-                                              // real meters via / DEG_PER_METER,
-                                              // as the .ino already does) -- only
-                                              // the internal computation changed
+    double calculateCurrDistance(int index); // meters
     double calculateCurrAngle(int index);
     Coordinates getCurrentPath(int i);
     void predictAhead(double elapsedSeconds, double speedMs);
@@ -64,33 +76,24 @@ private:
     double currentHeading;   // degrees, filtered estimate of actual direction of travel
     bool headingEstablished; // false until a trustworthy heading measurement has been taken
 
-    // --- LOCAL TANGENT-PLANE PRECISION FIX ---
-    // Every point above is still stored as an absolute decimal-degree
-    // lon/lat (e.g. -105.0167711), same as before, so nothing outside
-    // this class needs to change. But doing trig (atan2/sqrt) DIRECTLY
-    // on absolute values like that wastes most of a float's ~7
-    // significant digits on the leading digits ("-105.0...") that are
-    // identical for every point on a path this small and carry zero
-    // steering-relevant information -- only the last couple of digits
-    // actually vary between waypoints.
-    //
-    // Every geometry calculation below instead first subtracts a fixed
-    // origin (the first point this class ever sees, via ensureOrigin())
-    // and converts to local EAST/NORTH meters via toLocalMeters(). That
-    // puts the float's whole precision budget toward the few hundred
-    // meters of actual variation in this path instead of an unchanging
-    // ~105-degree offset, and it fixes a separate bug where a single
-    // DEG_PER_METER constant was implicitly treating 1 degree of
-    // longitude as the same distance as 1 degree of latitude -- they
-    // aren't equal except at the equator (roughly 15% shorter at ~40°N,
-    // where this car's KNOWN_START_LAT sits).
+    // --- LOCAL TANGENT PLANE ---
+    // Geometry runs in EAST/NORTH meters relative to a fixed origin (the
+    // first point this class ever sees), so a float's precision budget
+    // goes to the few hundred meters of real variation along the path
+    // rather than the unchanging ~105-degree offset shared by every
+    // point. The degree -> meter conversion also scales longitude by
+    // cos(latitude), which a single DEG_PER_METER constant did not: a
+    // degree of longitude is ~23% shorter than a degree of latitude at
+    // this car's ~40N starting point.
     bool originSet;
-    double originX;       // longitude of the origin, decimal degrees
-    double originY;       // latitude of the origin, decimal degrees
-    double cosOriginLat;  // cached cos(originY in radians), for longitude scaling
+    int32_t originX;      // longitude of the origin, 1e-7 degrees
+    int32_t originY;      // latitude of the origin, 1e-7 degrees
+    double cosOriginLat;  // cached cos(origin latitude in radians), for longitude scaling
 
-    void ensureOrigin(double x, double y);
-    void toLocalMeters(double x, double y, double &outEastMeters, double &outNorthMeters);
+    void ensureOrigin(int32_t lonE7, int32_t latE7);
+    void toLocalMeters(int32_t lonE7, int32_t latE7, double &outEastMeters, double &outNorthMeters);
+    int32_t lonE7FromEastMeters(double eastMeters);
+    int32_t latE7FromNorthMeters(double northMeters);
     double blendHeadings(double oldHeadingDeg, double newHeadingDeg, double alpha);
 };
 
